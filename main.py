@@ -1,27 +1,34 @@
 
-from flask import Flask, request, render_template_string, Response
+import os
+import csv
+import base64
+from io import BytesIO, StringIO
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from io import BytesIO, StringIO
-import base64
-import csv
+
+from flask import (
+    Flask,
+    render_template_string,
+    request,
+    redirect,
+    url_for,
+    send_file,
+    flash,
+)
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "cardioclean-local-key")
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
-# =========================================================
-# CARDIOCLEAN - ECG SIGNAL NOISE REMOVAL WEB APPLICATION
-# =========================================================
+# --------------------------------------------------
+# GLOBAL ECG DATA
+# --------------------------------------------------
 
 FS = 500
 DURATION = 10
-
-BG = "#0b1220"
-BLUE = "#55b8ff"
-GREEN = "#42dfa0"
-RED = "#ff7185"
-YELLOW = "#ffd166"
 
 time_data = np.array([])
 clean_data = np.array([])
@@ -30,59 +37,93 @@ filtered_data = np.array([])
 data_source = "Built-in simulated ECG"
 
 
-# ---------------- SIGNAL GENERATION ----------------
+# --------------------------------------------------
+# SIGNAL GENERATION
+# --------------------------------------------------
 
 def generate_signal():
+    """Generate a simulated ECG signal and add artificial noise."""
     global time_data, clean_data, noisy_data, filtered_data
+    global data_source
 
     time_data = np.arange(0, DURATION, 1 / FS)
+
+    # Create a simulated ECG waveform using Gaussian components.
     clean_data = np.zeros_like(time_data)
+    beat_times = np.arange(0.5, DURATION, 1.0)
 
-    # Generate an educational ECG-like waveform.
-    for beat in range(10):
-        center = beat + 0.5
-
-        clean_data += 0.12 * np.exp(
-            -((time_data - (center - 0.20)) / 0.04) ** 2
+    for beat in beat_times:
+        clean_data += (
+            0.12 * np.exp(-((time_data - (beat - 0.20)) / 0.045) ** 2)
         )
-        clean_data -= 0.15 * np.exp(
-            -((time_data - (center - 0.045)) / 0.015) ** 2
+        clean_data += (
+            -0.15 * np.exp(-((time_data - (beat - 0.045)) / 0.014) ** 2)
         )
-        clean_data += 1.00 * np.exp(
-            -((time_data - center) / 0.018) ** 2
+        clean_data += (
+            1.00 * np.exp(-((time_data - beat) / 0.018) ** 2)
         )
-        clean_data -= 0.25 * np.exp(
-            -((time_data - (center + 0.04)) / 0.02) ** 2
+        clean_data += (
+            -0.25 * np.exp(-((time_data - (beat + 0.035)) / 0.020) ** 2)
         )
-        clean_data += 0.30 * np.exp(
-            -((time_data - (center + 0.25)) / 0.07) ** 2
+        clean_data += (
+            0.30 * np.exp(-((time_data - (beat + 0.24)) / 0.085) ** 2)
         )
 
-    rng = np.random.default_rng(7)
-    powerline = 0.25 * np.sin(2 * np.pi * 50 * time_data)
-    random_noise = 0.15 * rng.normal(size=len(time_data))
+    # Add 50 Hz power-line interference and random noise.
+    rng = np.random.default_rng(42)
+    powerline_noise = 0.12 * np.sin(2 * np.pi * 50 * time_data)
+    random_noise = 0.08 * rng.normal(size=len(time_data))
+    baseline_wander = 0.08 * np.sin(2 * np.pi * 0.5 * time_data)
 
-    noisy_data = clean_data + powerline + random_noise
+    noisy_data = clean_data + powerline_noise + random_noise + baseline_wander
     filtered_data = apply_filter(noisy_data)
 
+    data_source = "Built-in simulated ECG"
+
+
+# --------------------------------------------------
+# DIGITAL FIR LOW-PASS FILTER
+# --------------------------------------------------
 
 def apply_filter(signal):
-    """Apply an FIR low-pass filter without extra toolboxes."""
+    """Apply an FIR low-pass filter to reduce high-frequency noise."""
+    signal = np.asarray(signal, dtype=float)
+
+    if signal.size < 2:
+        return signal.copy()
+
     order = 80
-    cutoff = 35
-    n = np.arange(order + 1)
+    cutoff = 35.0
     normalized_cutoff = cutoff / (FS / 2)
 
+    taps = np.arange(order + 1) - order / 2
     coefficients = normalized_cutoff * np.sinc(
-        normalized_cutoff * (n - order / 2)
+        normalized_cutoff * taps
     )
     coefficients *= np.hamming(order + 1)
     coefficients /= np.sum(coefficients)
 
-    return np.convolve(signal, coefficients, mode="same")
+    # Avoid a longer output or edge-size mismatch.
+    filtered = np.convolve(signal, coefficients, mode="same")
 
+    return filtered
+
+
+# --------------------------------------------------
+# SIGNAL QUALITY METRICS
+# --------------------------------------------------
 
 def calculate_snr(reference, observed):
+    """Calculate signal-to-noise ratio in decibels."""
+    reference = np.asarray(reference, dtype=float)
+    observed = np.asarray(observed, dtype=float)
+
+    if reference.size == 0 or observed.size == 0:
+        return 0.0
+
+    if reference.size != observed.size:
+        return 0.0
+
     noise = observed - reference
     signal_power = np.mean(reference ** 2)
     noise_power = np.mean(noise ** 2)
@@ -90,679 +131,560 @@ def calculate_snr(reference, observed):
     if noise_power < 1e-12:
         return 99.0
 
-    return 10 * np.log10(
-        max(signal_power, 1e-12) / noise_power
-    )
+    if signal_power < 1e-12:
+        return 0.0
+
+    return float(10 * np.log10(signal_power / noise_power))
 
 
-# ---------------- GRAPHS ----------------
+def calculate_rmse(reference, observed):
+    """Calculate root mean square error."""
+    if len(reference) == 0 or len(observed) == 0:
+        return 0.0
 
-def graph_image(lines, title, xlabel="Time (seconds)",
-                ylabel="Amplitude"):
-    fig, ax = plt.subplots(figsize=(10, 3.2))
-    fig.patch.set_facecolor("#151f32")
-    ax.set_facecolor("#151f32")
+    return float(np.sqrt(np.mean((reference - observed) ** 2)))
 
-    for x, y, label, color in lines:
-        ax.plot(x, y, label=label, color=color, linewidth=1)
 
-    ax.set_title(title, color="white", loc="left", pad=12)
-    ax.set_xlabel(xlabel, color="#a9b8ce")
-    ax.set_ylabel(ylabel, color="#a9b8ce")
-    ax.tick_params(colors="#a9b8ce")
-    ax.grid(True, alpha=0.2)
+def metric(value, suffix=""):
+    """Format a numeric metric for display."""
+    return f"{value:.3f}{suffix}"
 
-    for spine in ax.spines.values():
-        spine.set_color("#40516b")
 
-    legend = ax.legend(facecolor="#1d2a40", edgecolor="#1d2a40")
-    for item in legend.get_texts():
-        item.set_color("white")
+# --------------------------------------------------
+# GRAPH GENERATION
+# --------------------------------------------------
+
+def graph_image(x, y, title, color, ylabel="Amplitude"):
+    """Create a graph and return it as a base64 image."""
+    fig, ax = plt.subplots(figsize=(9, 3.2))
+
+    ax.plot(x, y, color=color, linewidth=1)
+    ax.set_title(title)
+    ax.set_xlabel("Time (seconds)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
 
-    output = BytesIO()
-    fig.savefig(
-        output, format="png", dpi=110,
-        facecolor=fig.get_facecolor()
-    )
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png", dpi=110)
     plt.close(fig)
 
-    return base64.b64encode(output.getvalue()).decode("ascii")
+    buffer.seek(0)
+    encoded = base64.b64encode(buffer.read()).decode("utf-8")
+    return "data:image/png;base64," + encoded
 
 
-def graph_html(encoded, alt):
-    return (
-        '<div class="card">'
-        f'<img class="graph" src="data:image/png;base64,{encoded}" '
-        f'alt="{alt}">'
-        '</div>'
-    )
+def graph_html(x, y, title, color, ylabel="Amplitude"):
+    """Return a graph image as HTML."""
+    image = graph_image(x, y, title, color, ylabel)
+    return f'<img src="{image}" alt="{title}" style="width:100%;border-radius:8px;">'
 
 
-def metric(title, value, color):
-    return (
-        '<div class="metric">'
-        f'<div class="label">{title}</div>'
-        f'<div class="value {color}">{value}</div>'
-        '</div>'
-    )
+# --------------------------------------------------
+# COMMON PAGE TEMPLATE
+# --------------------------------------------------
 
-
-def metrics_grid(items):
-    return '<div class="grid">' + "".join(
-        metric(a, b, c) for a, b, c in items
-    ) + '</div>'
-
-
-# ---------------- WEBSITE TEMPLATE ----------------
-
-PAGES = [
-    ("Home", "home"),
-    ("Signal Generation", "signal"),
-    ("Noise Addition", "noise"),
-    ("Noise Removal", "filter_page"),
-    ("Results", "results")
-]
-
-BASE_HTML = """
+PAGE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ title }} | CardioClean</title>
-<style>
-* { box-sizing: border-box; }
-body {
-    margin: 0;
-    background: #0b1220;
-    color: #f3f6fc;
-    font-family: Arial, Helvetica, sans-serif;
-}
-header {
-    background: #101a2b;
-    padding: 20px 5%;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    border-bottom: 1px solid #26354b;
-    gap: 15px;
-}
-.logo { color: #55b8ff; font-size: 25px; font-weight: bold; }
-.small { color: #a9b8ce; font-size: 12px; }
-nav {
-    display: flex;
-    gap: 8px;
-    padding: 14px 5%;
-    background: #111b2d;
-    flex-wrap: wrap;
-}
-nav a {
-    color: #d7e2f2;
-    text-decoration: none;
-    padding: 10px 13px;
-    border-radius: 7px;
-    font-size: 14px;
-}
-nav a:hover, nav a.active {
-    background: #243750;
-    color: #55b8ff;
-}
-main { max-width: 1200px; margin: auto; padding: 28px 24px; }
-h1 { font-size: 30px; margin: 0 0 10px; }
-h2 { font-size: 20px; }
-p { line-height: 1.7; color: #d4dfef; }
-.subtitle { color: #a9b8ce; margin-bottom: 25px; }
-.hero {
-    background: linear-gradient(130deg, #172c49, #15243a);
-    border: 1px solid #2c4260;
-    border-radius: 18px;
-    padding: 34px;
-    margin: 20px 0;
-}
-.hero h1 { color: #55b8ff; font-size: 35px; }
-.grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-    gap: 15px;
-    margin: 22px 0;
-}
-.card {
-    background: #151f32;
-    border: 1px solid #26354b;
-    border-radius: 13px;
-    padding: 21px;
-    margin: 15px 0;
-}
-.metric {
-    background: #1d2a40;
-    border-radius: 12px;
-    padding: 19px;
-}
-.metric .label { color: #a9b8ce; font-size: 13px; }
-.metric .value {
-    font-size: 25px;
-    font-weight: bold;
-    margin-top: 10px;
-}
-.blue { color: #55b8ff; }
-.green { color: #42dfa0; }
-.red { color: #ff7185; }
-.yellow { color: #ffd166; }
-.graph {
-    width: 100%;
-    height: auto;
-    display: block;
-    border-radius: 10px;
-    margin-top: 10px;
-}
-.button {
-    display: inline-block;
-    background: #42dfa0;
-    color: #0b1220;
-    text-decoration: none;
-    font-weight: bold;
-    padding: 13px 20px;
-    border-radius: 8px;
-    border: none;
-    cursor: pointer;
-    margin: 6px 5px 6px 0;
-}
-.button.bluebtn { background: #55b8ff; }
-.button.secondary { background: #243750; color: white; }
-.button.yellowbtn { background: #ffd166; }
-.actions {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    margin-top: 25px;
-    gap: 10px;
-}
-.upload-message {
-    padding: 12px;
-    border-radius: 8px;
-    overflow-wrap: anywhere;
-}
-.upload-message:empty { display: none; }
-.upload-message.success { color: #42dfa0; background: #12352f; }
-.upload-message.error { color: #ff7185; background: #3a202b; }
-.upload-message.info { color: #55b8ff; background: #172c49; }
-input[type=file] {
-    display: block;
-    color: #d4dfef;
-    margin: 15px 0;
-    max-width: 100%;
-}
-footer {
-    text-align: center;
-    color: #8799b3;
-    border-top: 1px solid #26354b;
-    padding: 20px;
-    font-size: 12px;
-}
-@media(max-width:650px) {
-    header { align-items: flex-start; flex-direction: column; }
-    h1 { font-size: 25px; }
-    .hero { padding: 22px; }
-    main { padding: 22px 15px; }
-}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} | CardioClean</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f4f7fb;
+            color: #17233c;
+        }
+        header {
+            background: #102b50;
+            color: white;
+            padding: 18px 6%;
+        }
+        header h1 { margin: 0 0 8px; }
+        nav { display: flex; flex-wrap: wrap; gap: 18px; }
+        nav a {
+            color: white;
+            text-decoration: none;
+            font-size: 14px;
+        }
+        nav a:hover { text-decoration: underline; }
+        main {
+            max-width: 1100px;
+            margin: 28px auto;
+            padding: 0 18px;
+        }
+        .card {
+            background: white;
+            padding: 22px;
+            margin-bottom: 20px;
+            border-radius: 12px;
+            box-shadow: 0 3px 14px rgba(20, 40, 70, 0.07);
+        }
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+            gap: 16px;
+        }
+        .number { font-size: 28px; font-weight: bold; color: #1677c8; }
+        .button {
+            display: inline-block;
+            background: #1677c8;
+            color: white;
+            border: 0;
+            padding: 11px 17px;
+            margin: 5px 5px 5px 0;
+            border-radius: 7px;
+            text-decoration: none;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .button:hover { background: #105c9b; }
+        .graph { width: 100%; overflow: hidden; }
+        .graph img { width: 100%; height: auto; }
+        input[type=file] { margin: 12px 0; max-width: 100%; }
+        .message { padding: 12px; background: #fff0f0; border-radius: 6px; }
+        .muted { color: #617086; }
+        footer { text-align: center; padding: 25px; color: #617086; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 10px; border-bottom: 1px solid #e5eaf0; }
+        @media(max-width: 600px) {
+            header { padding: 18px; }
+            nav { gap: 12px; }
+            main { margin-top: 18px; }
+            .card { padding: 16px; }
+        }
+    </style>
 </head>
 <body>
 <header>
-    <div class="logo">♥ CARDIOCLEAN</div>
-    <div class="small">ECG SIGNAL NOISE REMOVAL SYSTEM</div>
+    <h1>CardioClean</h1>
+    <div style="margin-bottom:14px;">ECG Signal Noise Removal System</div>
+    <nav>
+        <a href="{{ url_for('home') }}">Home</a>
+        <a href="{{ url_for('signal') }}">Signal</a>
+        <a href="{{ url_for('noise') }}">Noise</a>
+        <a href="{{ url_for('filter_page') }}">Filtering</a>
+        <a href="{{ url_for('results') }}">Results</a>
+        <a href="{{ url_for('download_data') }}">Download CSV</a>
+    </nav>
 </header>
-<nav>
-    {% for item in pages %}
-    <a href="{{ url_for(item[1]) }}"
-       class="{% if endpoint == item[1] %}active{% endif %}">
-       {{ item[0] }}
-    </a>
-    {% endfor %}
-</nav>
+
 <main>
-    {{ body|safe }}
-    <div class="actions">
-        {% if previous %}
-        <a class="button secondary" href="{{ url_for(previous) }}">
-            ← Previous
-        </a>
-        {% else %}
-        <span></span>
+    {% with messages = get_flashed_messages() %}
+        {% if messages %}
+            {% for message in messages %}
+                <div class="card message">{{ message }}</div>
+            {% endfor %}
         {% endif %}
-        {% if next_page %}
-        <a class="button" href="{{ url_for(next_page) }}">
-            {% if endpoint == 'home' %}START PROJECT →{% else %}NEXT →{% endif %}
-        </a>
-        {% endif %}
-    </div>
+    {% endwith %}
+
+    {{ content|safe }}
 </main>
+
 <footer>
-    CARDIOCLEAN · DIGITAL SIGNAL PROCESSING · EDUCATIONAL SIMULATION
+    CardioClean · Educational ECG signal processing project
 </footer>
 </body>
 </html>
 """
 
 
-def render_page(title, body, endpoint, previous=None, next_page=None):
+def render_page(title, content):
     return render_template_string(
-        BASE_HTML,
+        PAGE,
         title=title,
-        body=body,
-        endpoint=endpoint,
-        pages=PAGES,
-        previous=previous,
-        next_page=next_page
+        content=content
     )
 
 
-# ---------------- HOME ----------------
+# --------------------------------------------------
+# HOME PAGE
+# --------------------------------------------------
 
 @app.route("/")
 def home():
-    body = """
-    <div class="hero">
-        <p class="blue"><b>WELCOME TO YOUR DSP PROJECT</b></p>
-        <h1>CLEAN SIGNALS.<br>CLEARER ANALYSIS.</h1>
-        <p>
-            Explore how digital filtering can reduce unwanted noise
-            from an ECG signal. Follow the complete process from
-            signal generation to the final results.
-        </p>
-        <a class="button" href="/signal">START PROJECT →</a>
-    </div>
-    """ + metrics_grid([
-        ("SAMPLING RATE", "500 Hz", "blue"),
-        ("DURATION", "10 seconds", "green"),
-        ("FILTER", "FIR Low-pass", "yellow")
-    ]) + """
+    content = f"""
     <div class="card">
-        <h2>Project Objective</h2>
+        <h2>Welcome to CardioClean</h2>
         <p>
-            Generate or import ECG data, inspect noise, apply a digital
-            filter, and compare signal quality using graphs and SNR.
+            CardioClean demonstrates digital signal processing by generating
+            an ECG signal, adding simulated noise, and applying a digital
+            low-pass FIR filter.
         </p>
+        <p class="muted">
+            Current data source: {data_source}
+        </p>
+        <a class="button" href="{url_for('signal')}">View ECG Signal</a>
+        <a class="button" href="{url_for('filter_page')}">View Filtered Signal</a>
+        <a class="button" href="{url_for('results')}">View Results</a>
     </div>
-    <div class="card">
-        <h2>Technologies</h2>
-        <p>Python, Flask, NumPy, Matplotlib and MATLAB Online.</p>
+
+    <div class="cards">
+        <div class="card">
+            <h3>Signal Generation</h3>
+            <p>Create a simulated ECG waveform.</p>
+        </div>
+        <div class="card">
+            <h3>Noise Addition</h3>
+            <p>Demonstrate power-line interference, baseline wander and random noise.</p>
+        </div>
+        <div class="card">
+            <h3>Digital Filtering</h3>
+            <p>Use an FIR low-pass filter to reduce high-frequency noise.</p>
+        </div>
+        <div class="card">
+            <h3>Result Analysis</h3>
+            <p>Compare the original, noisy and filtered signals.</p>
+        </div>
     </div>
-    """
-    return render_page("Home", body, "home", next_page="signal")
-
-
-# ---------------- SIGNAL GENERATION + CSV UPLOAD ----------------
-
-@app.route("/signal", methods=["GET", "POST"])
-def signal():
-    global time_data, clean_data, noisy_data, filtered_data, data_source
-
-    message = ""
-    message_type = "info"
-
-    if request.method == "POST":
-        uploaded = request.files.get("ecg_file")
-
-        if not uploaded or not uploaded.filename:
-            message = "Please choose a CSV file first."
-            message_type = "error"
-        elif not uploaded.filename.lower().endswith(".csv"):
-            message = "Please upload a .csv file, not an image."
-            message_type = "error"
-        else:
-            try:
-                content = uploaded.read().decode("utf-8-sig")
-                rows = list(csv.DictReader(StringIO(content)))
-
-                required = [
-                    "Time", "Clean_ECG", "Noisy_ECG", "Filtered_ECG"
-                ]
-
-                if not rows:
-                    raise ValueError("The selected CSV is empty.")
-
-                if any(column not in rows[0] for column in required):
-                    raise ValueError(
-                        "Required columns: Time, Clean_ECG, Noisy_ECG, "
-                        "Filtered_ECG. Please use ECG_Results.csv from "
-                        "our MATLAB script."
-                    )
-
-                new_time = np.array(
-                    [float(row["Time"]) for row in rows]
-                )
-                new_clean = np.array(
-                    [float(row["Clean_ECG"]) for row in rows]
-                )
-                new_noisy = np.array(
-                    [float(row["Noisy_ECG"]) for row in rows]
-                )
-                new_filtered = np.array(
-                    [float(row["Filtered_ECG"]) for row in rows]
-                )
-
-                if len(new_time) < 2:
-                    raise ValueError("The CSV needs at least two samples.")
-
-                if not all(
-                    len(a) == len(new_time)
-                    for a in [new_clean, new_noisy, new_filtered]
-                ):
-                    raise ValueError("The CSV columns have different lengths.")
-
-                if not all(
-                    np.all(np.isfinite(a))
-                    for a in [new_time, new_clean, new_noisy, new_filtered]
-                ):
-                    raise ValueError("The CSV contains invalid numbers.")
-
-                if np.any(np.diff(new_time) <= 0):
-                    raise ValueError(
-                        "Time values must be strictly increasing."
-                    )
-
-                # Only replace current data after successful validation.
-                time_data = new_time
-                clean_data = new_clean
-                noisy_data = new_noisy
-                filtered_data = new_filtered
-                data_source = uploaded.filename
-
-                message = (
-                    f"Loaded successfully! {len(new_time):,} samples "
-                    f"imported from {uploaded.filename}."
-                )
-                message_type = "success"
-
-            except Exception as error:
-                message = f"Could not load CSV: {error}"
-                message_type = "error"
-
-    duration = time_data[-1] - time_data[0]
-    encoded = graph_image(
-        [(time_data, clean_data, "Original ECG", BLUE)],
-        "Original ECG Signal"
-    )
-
-    body = """
-    <h1>01 | Signal Generation</h1>
-    <p class="subtitle">
-        Upload your MATLAB ECG CSV, or use the built-in simulated signal.
-    </p>
 
     <div class="card">
-        <h2>Upload Your ECG CSV</h2>
-        <p>
-            Select ECG_Results.csv generated by ECG_Noise_Removal.m.
-            The imported data will be used throughout the dashboard.
-        </p>
-        <form method="POST" enctype="multipart/form-data">
-            <input type="file" name="ecg_file" accept=".csv" required>
-            <button class="button" type="submit">UPLOAD ECG DATA</button>
+        <h2>Upload ECG data</h2>
+        <p>Upload a CSV file containing your ECG samples.</p>
+        <form action="{url_for('upload_csv')}" method="post" enctype="multipart/form-data">
+            <input type="file" name="file" accept=".csv" required>
+            <br>
+            <button class="button" type="submit">Upload CSV</button>
         </form>
-        <p class="upload-message {{ message_type }}">{{ message }}</p>
-    </div>
-    """ + metrics_grid([
-        ("DATA SOURCE", data_source, "blue"),
-        ("DURATION", f"{duration:.2f} seconds", "green"),
-        ("TOTAL SAMPLES", f"{len(time_data):,}", "yellow")
-    ]) + graph_html(encoded, "Original ECG signal") + """
-    <div class="card">
-        <h2>Observation</h2>
-        <p>
-            The graph shows the original signal currently loaded.
-            Continue to Noise Addition to inspect the effect of noise.
+        <p class="muted">
+            Supported columns: Time, Clean_ECG, Noisy_ECG, Filtered_ECG.
+            The Time column is optional.
         </p>
     </div>
     """
+    return render_page("Home", content)
 
-    body = render_template_string(
-        body, message=message, message_type=message_type
+
+# --------------------------------------------------
+# SIGNAL PAGE
+# --------------------------------------------------
+
+@app.route("/signal")
+def signal():
+    if time_data.size == 0:
+        generate_signal()
+
+    duration = float(time_data[-1] - time_data[0]) if time_data.size > 1 else 0
+
+    clean_graph = graph_html(
+        time_data, clean_data, "Original ECG Signal", "#1677c8"
     )
 
-    return render_page(
-        "Signal Generation", body, "signal",
-        previous="home", next_page="noise"
-    )
+    content = f"""
+    <div class="card">
+        <h2>Original ECG Signal</h2>
+        <p>View the clean simulated ECG waveform before adding noise.</p>
+        <div class="graph">{clean_graph}</div>
+        <div class="cards">
+            <div><p class="muted">Sampling frequency</p><div class="number">{FS} Hz</div></div>
+            <div><p class="muted">Duration</p><div class="number">{duration:.2f} s</div></div>
+            <div><p class="muted">Samples</p><div class="number">{len(time_data)}</div></div>
+        </div>
+        <a class="button" href="{url_for('noise')}">Continue to Noise Analysis</a>
+    </div>
+    """
+    return render_page("Signal", content)
 
 
-# ---------------- NOISE ADDITION ----------------
+# --------------------------------------------------
+# NOISE PAGE
+# --------------------------------------------------
 
 @app.route("/noise")
 def noise():
-    before = calculate_snr(clean_data, noisy_data)
+    if time_data.size == 0:
+        generate_signal()
 
-    encoded = graph_image([
-        (time_data, noisy_data, "Noisy ECG", RED)
-    ], "Noisy ECG Signal")
-
-    body = """
-    <h1>02 | Noise Addition</h1>
-    <p class="subtitle">Inspect the ECG signal after noise has been added.</p>
-    <div class="card">
-        <h2>What is noise?</h2>
-        <p>
-            Noise is an unwanted change in a signal. In this demonstration,
-            the supplied data contains a noisy ECG column. For the built-in
-            data, 50 Hz interference and random noise are added.
-        </p>
-    </div>
-    """ + metrics_grid([
-        ("SNR BEFORE FILTERING", f"{before:.2f} dB", "red"),
-        ("DATA SOURCE", data_source, "blue")
-    ]) + graph_html(encoded, "Noisy ECG signal") + """
-    <div class="card">
-        <h2>Observation</h2>
-        <p>Notice the unwanted variations in the noisy waveform.</p>
-    </div>
-    """
-    return render_page(
-        "Noise Addition", body, "noise",
-        previous="signal", next_page="filter_page"
+    clean_graph = graph_html(
+        time_data, clean_data, "Clean ECG", "#1677c8"
+    )
+    noisy_graph = graph_html(
+        time_data, noisy_data, "ECG with Added Noise", "#d9534f"
     )
 
+    noisy_snr = calculate_snr(clean_data, noisy_data)
 
-# ---------------- NOISE REMOVAL ----------------
+    content = f"""
+    <div class="card">
+        <h2>Noise Analysis</h2>
+        <p>Compare the original ECG with the signal containing simulated noise.</p>
+        <h3>Original ECG</h3>
+        <div class="graph">{clean_graph}</div>
+        <h3>Noisy ECG</h3>
+        <div class="graph">{noisy_graph}</div>
+        <div class="cards">
+            <div><p class="muted">SNR before filtering</p><div class="number">{noisy_snr:.2f} dB</div></div>
+            <div><p class="muted">Noise types</p><strong>Power-line, random and baseline wander</strong></div>
+        </div>
+        <a class="button" href="{url_for('filter_page')}">Apply Filter</a>
+    </div>
+    """
+    return render_page("Noise Analysis", content)
+
+
+# --------------------------------------------------
+# FILTER PAGE
+# --------------------------------------------------
 
 @app.route("/filter")
 def filter_page():
-    before_graph = graph_image([
-        (time_data, noisy_data, "Noisy ECG", RED)
-    ], "Noisy ECG before filtering")
+    if time_data.size == 0:
+        generate_signal()
 
-    after_graph = graph_image([
-        (time_data, filtered_data, "Filtered ECG", GREEN)
-    ], "Filtered ECG after noise removal")
-
-    frequencies = np.fft.rfftfreq(
-        len(time_data),
-        d=(time_data[1] - time_data[0])
+    clean_graph = graph_html(
+        time_data, clean_data, "Original ECG", "#1677c8"
     )
-    noisy_spectrum = np.abs(np.fft.rfft(noisy_data)) / len(time_data)
-    filtered_spectrum = (
-        np.abs(np.fft.rfft(filtered_data)) / len(time_data)
+    noisy_graph = graph_html(
+        time_data, noisy_data, "Noisy ECG", "#d9534f"
+    )
+    filtered_graph = graph_html(
+        time_data, filtered_data, "Filtered ECG", "#19966b"
     )
 
-    spectrum = graph_image([
-        (frequencies, noisy_spectrum, "Noisy", RED),
-        (frequencies, filtered_spectrum, "Filtered", GREEN)
-    ], "Frequency Spectrum", "Frequency (Hz)", "Magnitude")
+    before_snr = calculate_snr(clean_data, noisy_data)
+    after_snr = calculate_snr(clean_data, filtered_data)
 
-    body = """
-    <h1>03 | Noise Removal</h1>
-    <p class="subtitle">Compare the signal before and after filtering.</p>
+    content = f"""
     <div class="card">
-        <h2>FIR Low-pass Filter</h2>
+        <h2>Digital Filtering</h2>
         <p>
-            The filter reduces higher-frequency components. It may also
-            remove useful signal details, so results must be interpreted
-            carefully.
+            The FIR low-pass filter uses a 35 Hz cutoff to reduce high-frequency
+            noise. Filtering cannot remove every type of noise perfectly.
         </p>
+        <h3>1. Original ECG</h3>
+        <div class="graph">{clean_graph}</div>
+        <h3>2. Noisy ECG</h3>
+        <div class="graph">{noisy_graph}</div>
+        <h3>3. Filtered ECG</h3>
+        <div class="graph">{filtered_graph}</div>
+        <div class="cards">
+            <div><p class="muted">SNR before filtering</p><div class="number">{before_snr:.2f} dB</div></div>
+            <div><p class="muted">SNR after filtering</p><div class="number">{after_snr:.2f} dB</div></div>
+            <div><p class="muted">Filter type</p><div class="number">FIR</div></div>
+            <div><p class="muted">Cutoff frequency</p><div class="number">35 Hz</div></div>
+        </div>
+        <a class="button" href="{url_for('results')}">View Final Results</a>
     </div>
-    <h2 class="red">Before Filtering</h2>
-    """ + graph_html(before_graph, "Noisy signal") + """
-    <h2 class="green">After Filtering</h2>
-    """ + graph_html(after_graph, "Filtered signal") + """
-    <h2 class="blue">Frequency Spectrum Comparison</h2>
-    """ + graph_html(spectrum, "Frequency spectrum") + """
+    """
+    return render_page("Filtering", content)
+
+
+# --------------------------------------------------
+# RESULTS PAGE
+# --------------------------------------------------
+
+@app.route("/results")
+def results():
+    if time_data.size == 0:
+        generate_signal()
+
+    before_snr = calculate_snr(clean_data, noisy_data)
+    after_snr = calculate_snr(clean_data, filtered_data)
+
+    before_rmse = calculate_rmse(clean_data, noisy_data)
+    after_rmse = calculate_rmse(clean_data, filtered_data)
+
+    improvement = after_snr - before_snr
+
+    clean_graph = graph_html(
+        time_data, clean_data, "Clean ECG", "#1677c8"
+    )
+    noisy_graph = graph_html(
+        time_data, noisy_data, "Noisy ECG", "#d9534f"
+    )
+    filtered_graph = graph_html(
+        time_data, filtered_data, "Filtered ECG", "#19966b"
+    )
+
+    content = f"""
     <div class="card">
-        <p>
-            The built-in signal uses an FIR low-pass filter with a 35 Hz
-            cutoff. Imported Filtered_ECG data is displayed as provided
-            by the uploaded CSV.
+        <h2>ECG Processing Results</h2>
+        <p>Review the measurements and compare the three signal stages.</p>
+        <div class="cards">
+            <div><p class="muted">SNR before filtering</p><div class="number">{before_snr:.2f} dB</div></div>
+            <div><p class="muted">SNR after filtering</p><div class="number">{after_snr:.2f} dB</div></div>
+            <div><p class="muted">SNR change</p><div class="number">{improvement:+.2f} dB</div></div>
+            <div><p class="muted">RMSE before filtering</p><div class="number">{before_rmse:.4f}</div></div>
+            <div><p class="muted">RMSE after filtering</p><div class="number">{after_rmse:.4f}</div></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>Signal comparison</h3>
+        <div class="graph">{clean_graph}</div>
+        <div class="graph">{noisy_graph}</div>
+        <div class="graph">{filtered_graph}</div>
+    </div>
+
+    <div class="card">
+        <h3>Download your results</h3>
+        <p>Export the signal samples to a CSV file.</p>
+        <a class="button" href="{url_for('download_data')}">Download ECG Results CSV</a>
+    </div>
+
+    <div class="card">
+        <p class="muted">
+            These are educational signal-processing measurements on simulated
+            or uploaded data. They are not a medical diagnosis.
         </p>
     </div>
     """
-    return render_page(
-        "Noise Removal", body, "filter_page",
-        previous="noise", next_page="results"
-    )
+    return render_page("Results", content)
 
 
-# ---------------- RESULTS + CSV UPLOAD ----------------
+# --------------------------------------------------
+# CSV UPLOAD
+# --------------------------------------------------
 
-@app.route("/results", methods=["GET", "POST"])
-def results():
+@app.route("/upload", methods=["POST"])
+def upload_csv():
     global time_data, clean_data, noisy_data, filtered_data, data_source
 
-    message = ""
+    uploaded_file = request.files.get("file")
 
-    # Optional CSV upload on the Results page as well.
-    if request.method == "POST":
-        uploaded = request.files.get("csv_file")
+    if uploaded_file is None or uploaded_file.filename == "":
+        flash("Please choose a CSV file first.")
+        return redirect(url_for("home"))
 
-        if uploaded and uploaded.filename:
-            try:
-                rows = list(csv.DictReader(
-                    StringIO(uploaded.read().decode("utf-8-sig"))
-                ))
-                required = [
-                    "Time", "Clean_ECG", "Noisy_ECG", "Filtered_ECG"
-                ]
+    if not uploaded_file.filename.lower().endswith(".csv"):
+        flash("Please upload a .csv file.")
+        return redirect(url_for("home"))
 
-                if not rows or any(k not in rows[0] for k in required):
-                    raise ValueError("CSV columns do not match the expected format.")
+    try:
+        content = uploaded_file.read().decode("utf-8-sig")
+        reader = csv.DictReader(StringIO(content))
 
-                nt = np.array([float(r["Time"]) for r in rows])
-                nc = np.array([float(r["Clean_ECG"]) for r in rows])
-                nn = np.array([float(r["Noisy_ECG"]) for r in rows])
-                nf = np.array([float(r["Filtered_ECG"]) for r in rows])
+        if not reader.fieldnames:
+            raise ValueError("The CSV file has no header row.")
 
-                if len(nt) < 2 or not all(
-                    len(a) == len(nt) for a in [nc, nn, nf]
-                ):
-                    raise ValueError("Invalid or incomplete CSV columns.")
+        # Match column names without depending on capitalization.
+        columns = {
+            name.strip().lower(): name
+            for name in reader.fieldnames
+            if name
+        }
 
-                if not all(np.all(np.isfinite(a)) for a in [nt, nc, nn, nf]):
-                    raise ValueError("CSV contains invalid numeric values.")
+        def get_column(row, possible_names):
+            for name in possible_names:
+                actual_name = columns.get(name.lower())
+                if actual_name is not None:
+                    value = row.get(actual_name, "")
+                    if value is not None and value.strip() != "":
+                        return float(value)
+            return None
 
-                if np.any(np.diff(nt) <= 0):
-                    raise ValueError("Time values must be increasing.")
+        rows = []
+        for row in reader:
+            t = get_column(row, ["Time", "time_seconds", "timestamp"])
+            clean = get_column(row, ["Clean_ECG", "clean", "clean_ecg", "original_ecg"])
+            noisy = get_column(row, ["Noisy_ECG", "noisy", "noisy_ecg"])
+            filtered = get_column(row, ["Filtered_ECG", "filtered", "filtered_ecg"])
 
-                time_data, clean_data = nt, nc
-                noisy_data, filtered_data = nn, nf
-                data_source = uploaded.filename
-                message = "CSV loaded successfully."
+            # A CSV containing a clean signal alone can also be used.
+            if clean is None:
+                clean = get_column(row, ["ECG", "Signal", "Amplitude", "Value"])
 
-            except Exception as error:
-                message = f"Could not load CSV: {error}"
+            if clean is None:
+                continue
+
+            rows.append((t, clean, noisy, filtered))
+
+        if len(rows) < 2:
+            raise ValueError(
+                "No usable ECG samples found. Include Clean_ECG or ECG values."
+            )
+
+        clean_values = np.array([r[1] for r in rows], dtype=float)
+
+        if all(r[0] is not None for r in rows):
+            new_time = np.array([r[0] for r in rows], dtype=float)
         else:
-            message = "Please choose a CSV file."
+            new_time = np.arange(len(rows), dtype=float) / FS
 
-    before = calculate_snr(clean_data, noisy_data)
-    after = calculate_snr(clean_data, filtered_data)
-    change = after - before
+        if all(r[2] is not None for r in rows):
+            new_noisy = np.array([r[2] for r in rows], dtype=float)
+        else:
+            rng = np.random.default_rng(42)
+            new_noisy = (
+                clean_values
+                + 0.12 * np.sin(2 * np.pi * 50 * new_time)
+                + 0.08 * rng.normal(size=len(clean_values))
+            )
 
-    original_graph = graph_image([
-        (time_data, clean_data, "Original ECG", BLUE)
-    ], "Original ECG Signal")
+        if all(r[3] is not None for r in rows):
+            new_filtered = np.array([r[3] for r in rows], dtype=float)
+        else:
+            new_filtered = apply_filter(new_noisy)
 
-    noisy_graph = graph_image([
-        (time_data, noisy_data, "Noisy ECG", RED)
-    ], "Noisy ECG Signal")
+        time_data = new_time
+        clean_data = clean_values
+        noisy_data = new_noisy
+        filtered_data = new_filtered
+        data_source = "Uploaded CSV"
 
-    filtered_graph = graph_image([
-        (time_data, filtered_data, "Filtered ECG", GREEN)
-    ], "Filtered ECG Signal")
+        flash(f"Successfully loaded {len(rows)} ECG samples.")
+        return redirect(url_for("results"))
 
-    body = """
-    <h1>04 | Results & Conclusion</h1>
-    <p class="subtitle">Review the three signals separately.</p>
-    """ + metrics_grid([
-        ("SNR BEFORE", f"{before:.2f} dB", "red"),
-        ("SNR AFTER", f"{after:.2f} dB", "green"),
-        ("SNR CHANGE", f"{change:+.2f} dB", "blue")
-    ]) + """
-    <h2 class="blue">Original ECG</h2>
-    """ + graph_html(original_graph, "Original ECG") + """
-    <h2 class="red">Noisy ECG</h2>
-    """ + graph_html(noisy_graph, "Noisy ECG") + """
-    <h2 class="green">Filtered ECG</h2>
-    """ + graph_html(filtered_graph, "Filtered ECG") + f"""
-    <div class="card">
-        <h2>Interpretation</h2>
-        <p>
-            SNR before filtering: {before:.2f} dB.
-            SNR after filtering: {after:.2f} dB.
-        </p>
-        <p>
-            {"SNR increased, indicating reduced error relative to the reference."
-             if change > 0 else
-             "SNR did not increase. The filter may need different parameters."}
-        </p>
-        <p class="small">
-            Educational simulation only. Not intended for medical diagnosis.
-        </p>
-    </div>
-    <div class="card">
-        <h2>Upload MATLAB Results</h2>
-        <form method="POST" enctype="multipart/form-data">
-            <input type="file" name="csv_file" accept=".csv" required>
-            <button class="button yellowbtn" type="submit">
-                UPLOAD MATLAB CSV
-            </button>
-        </form>
-        <p>{message}</p>
-        <a class="button bluebtn" href="/download-data">DOWNLOAD CURRENT CSV</a>
-    </div>
-    """
-    return render_page(
-        "Results", body, "results",
-        previous="filter_page"
-    )
+    except (ValueError, UnicodeDecodeError, csv.Error) as error:
+        flash(f"Could not read the CSV file: {error}")
+        return redirect(url_for("home"))
 
 
-# ---------------- DOWNLOAD CSV ----------------
+# --------------------------------------------------
+# CSV DOWNLOAD
+# --------------------------------------------------
 
 @app.route("/download-data")
 def download_data():
+    if time_data.size == 0:
+        generate_signal()
+
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Time", "Clean_ECG", "Noisy_ECG", "Filtered_ECG"])
 
-    for values in zip(time_data, clean_data, noisy_data, filtered_data):
-        writer.writerow(values)
+    writer.writerow([
+        "Time",
+        "Clean_ECG",
+        "Noisy_ECG",
+        "Filtered_ECG"
+    ])
 
-    return Response(
-        output.getvalue(),
+    for i in range(len(time_data)):
+        writer.writerow([
+            time_data[i],
+            clean_data[i],
+            noisy_data[i],
+            filtered_data[i]
+        ])
+
+    csv_bytes = BytesIO(output.getvalue().encode("utf-8"))
+    csv_bytes.seek(0)
+
+    return send_file(
+        csv_bytes,
         mimetype="text/csv",
-        headers={
-            "Content-Disposition":
-                "attachment; filename=ECG_Results.csv"
-        }
+        as_attachment=True,
+        download_name="ECG_Results.csv"
     )
 
 
-# ---------------- RUN WEBSITE ----------------
+# --------------------------------------------------
+# STARTUP
+# IMPORTANT: Generate data before any page needs it.
+# --------------------------------------------------
+
+generate_signal()
+
+
+# --------------------------------------------------
+# LOCAL DEVELOPMENT
+# Render uses its configured Gunicorn start command.
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    generate_signal()
-    print("=" * 50)
-    print("CARDIOCLEAN WEB DASHBOARD")
-    print("Open Chrome at http://127.0.0.1:5000")
-    print("=" * 50)
-    app.run(debug=True, host="127.0.0.1", port=5000)
+    app.run(debug=True)
