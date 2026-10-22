@@ -246,7 +246,8 @@ def home():
 def signal():
     if time_data.size == 0:
         generate_signal()
-
+if time_data.size == 0:
+    generate_signal()
     duration = time_data[-1] - time_data[0] if len(time_data) > 1 else 0
     graph = graph_html(time_data, clean_data, "Original ECG Signal", "#1677c8")
 
